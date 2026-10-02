@@ -1,0 +1,84 @@
+# Builds a release of Prosight Graph from a tag of its private source repository and publishes it here.
+# A new tag there is picked up on the next half hour; `workflow_dispatch` builds a given tag now.
+name: release
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'the tag to build (vX.Y.Z); empty = the newest one not released yet'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE: git@github.com:BohdanTanasov/prosight-graph.git
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GRAPH_DEPLOY_KEY }}
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${WANT:-}" ]; then v="$WANT"; else
+            v=$(git ls-remote --tags --refs "$SOURCE" 'v*' | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          fi
+          if [ -z "$v" ]; then echo "no tag"; exit 0; fi
+          if gh release view "$v" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "$v is released"; exit 0; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: pick
+    if: needs.pick.outputs.version != ''
+    strategy:
+      matrix:
+        runner: [macos-14, macos-13]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GRAPH_DEPLOY_KEY }}
+      - name: source at the tag
+        run: git clone -q --depth 1 --branch "${{ needs.pick.outputs.version }}" "$SOURCE" src
+      - uses: astral-sh/setup-uv@v6
+      - name: build
+        run: python3 src/poc/release.py --version "${{ needs.pick.outputs.version }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graph-${{ matrix.runner }}
+          path: dist/*
+
+  publish:
+    needs: [pick, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: parts
+      - name: one release.json for both platforms
+        run: |
+          set -euo pipefail
+          mkdir out
+          cp parts/*/prosight-graph-*.tar.gz parts/*/prosight-graph-*.tar.gz.sha256 out/
+          python3 - <<'PY'
+          import glob, json
+          ms = [json.load(open(f)) for f in glob.glob('parts/*/release.json')]
+          m = dict(ms[0]); m['assets'] = {}
+          for x in ms: m['assets'].update(x['assets'])
+          json.dump(m, open('out/release.json', 'w'), indent=1)
+          PY
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ needs.pick.outputs.version }}" out/* -R "$GITHUB_REPOSITORY" --title "Prosight Graph ${{ needs.pick.outputs.version }}" --notes "Built from the private source at ${{ needs.pick.outputs.version }}."
