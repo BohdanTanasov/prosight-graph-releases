@@ -44,8 +44,12 @@ jobs:
     if: needs.pick.outputs.version != ''
     strategy:
       matrix:
-        # Apple Silicon; an Intel build (macos-13) can be added back when someone needs it
-        runner: [macos-14]
+        include:
+          - { runner: macos-14, arch: arm64 }
+          # an Intel Mac's archive, built on Apple Silicon and checked under Rosetta (macos-13 runners queue for hours)
+          - { runner: macos-14, arch: x86_64 }
+          - { runner: ubuntu-24.04, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: webfactory/ssh-agent@v0.9.0
@@ -53,12 +57,22 @@ jobs:
           ssh-private-key: ${{ secrets.GRAPH_DEPLOY_KEY }}
       - name: source at the tag
         run: git clone -q --depth 1 --branch "${{ needs.pick.outputs.version }}" "$SOURCE" src
+      - name: Rosetta, for the Intel archive's check
+        if: runner.os == 'macOS' && matrix.arch == 'x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
       - uses: astral-sh/setup-uv@v6
       - name: build
-        run: python3 src/poc/release.py --version "${{ needs.pick.outputs.version }}" --out dist
+        run: python3 src/poc/release.py --version "${{ needs.pick.outputs.version }}" --arch "${{ matrix.arch }}" --out dist
+      - name: the archive runs where it lands (unpacked elsewhere, no uv, no system Python on its path)
+        run: |
+          set -euo pipefail
+          mkdir t && tar -xzf dist/prosight-graph-*.tar.gz -C t
+          env -i PATH=/usr/bin:/bin HOME="$HOME" t/.venv/bin/python -c "import platform, graphify, tree_sitter_php, mcp, yaml; print('ok', platform.system(), platform.machine())"
+          env -i PATH=/usr/bin:/bin HOME="$HOME" t/.venv/bin/python t/poc/pg_secrets.py
+          cat t/VERSION.json
       - uses: actions/upload-artifact@v4
         with:
-          name: graph-${{ matrix.runner }}
+          name: graph-${{ runner.os }}-${{ matrix.arch }}
           path: dist/*
 
   publish:
